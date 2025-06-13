@@ -937,3 +937,187 @@ def topk_thrust(
         out = out[1]
 
     return out
+
+
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# pylint: disable=invalid-name
+"""searchsorted operator"""
+import tvm
+from tvm import te
+from tvm.tir import ir_builder
+
+from .. import utils
+from ..math import cast
+
+def binary_search_gpu(
+    ib: ir_builder.IRBuilder,
+    sequence_offset,
+    search_range,
+    sorted_sequence,
+    value,
+    right,
+    out_dtype,
+):
+    """
+    Generates IR for a full binary search, intended for execution by a single thread.
+
+    `sorted_sequence` is a N-D Buffer whose innermost dimension we want to search for `value`,
+    and `search_range` is the size of the innermost dimension. `sequence_offset` is
+    a 1-D linearlized offset specifying which of innermost sequences to search.
+
+    So the search for `value` is performed over
+    `sorted_sequence[sequence_offset:(sequence_offset + search_range)]`.
+    Note that we index N-D Buffer by 1-D linearlized indices.
+    """
+    # Allocate local registers for the lower and upper bounds of the search.
+    lo = ib.allocate(out_dtype, (1,), name="lo", scope="local")
+    hi = ib.allocate(out_dtype, (1,), name="hi", scope="local")
+
+    lo[0] = cast(0, out_dtype)
+    hi[0] = cast(search_range, out_dtype)
+
+    # Define the comparison condition based on the 'right' parameter.
+    # This is equivalent to numpy.searchsorted's 'side' parameter.
+    # if right=False (side='left'), we search for the first element >= value.
+    # if right=True (side='right'), we search for the first element > value.
+    def condition(current_val, target_val):
+        if right:
+            # side='right': Find insertion point for val which keeps list sorted.
+            # This means we continue searching as long as elements are <= val.
+            return current_val <= target_val
+        # side='left': Find first element >= val.
+        # This means we continue searching as long as elements are < val.
+        return current_val < target_val
+
+    # --- THIS IS THE CRITICAL FIX ---
+    # A binary search requires a loop to narrow the [lo, hi) range.
+    with ib.while_loop(lo[0] < hi[0]):
+        # Calculate the midpoint, preventing overflow for large ranges.
+        mid = lo[0] + ((hi[0] - lo[0]) >> 1)
+        # Compare the value at the midpoint with the search value.
+        with ib.if_scope(condition(sorted_sequence[sequence_offset + mid], value)):
+            # If the condition is met, the insertion point must be in the upper half.
+            lo[0] = mid + 1
+        with ib.else_scope():
+            # Otherwise, the insertion point is in the lower half (including mid).
+            hi[0] = mid
+
+    # The loop terminates when lo == hi, which is the insertion index.
+    return lo[0]
+
+
+def searchsorted(sorted_sequence, values, right=False, out_dtype="int64"):
+    """Find indices where elements should be inserted to maintain order.
+       If `sorted_sequence` is N-dimensional, the innermost dimension of
+       `values` are searched in the corresponding dimension of `sorted_sequence`.
+
+       This implementation is optimized for GPU execution.
+
+    Parameters
+    ----------
+    sorted_sequence : te.Tensor
+        N-D or 1-D Tensor, containing monotonically increasing sequence
+        on the innermost dimension.
+
+    values : te.Tensor
+        N-D Tensor containing the search values. When `sorted_sequence` is 1-D,
+        the shape of `values` can be arbitrary. Otherwise, ranks of `sorted_sequence`
+        and `values` must be the same, and outer N-1 axes must have the same size.
+
+    right : bool, optional
+        Controls which index is returned if a value lands exactly on one of sorted values. If
+        False (side='left'), the index of the first suitable location found is given. If true
+        (side='right'), return the last such index.
+
+    out_dtype : string, optional
+        The data type of the output indices.
+
+    Returns
+    -------
+    indices : te.Tensor
+        Tensor with same shape as values, representing the indices of
+        elements of `values` if they are inserted in `sorted_sequence`.
+    """
+    if len(sorted_sequence.shape) > 1:
+        # For N-D inputs, ensure the outer dimensions match
+        for i in range(len(values.shape) - 1):
+            assert (
+                values.shape[i] == sorted_sequence.shape[i]
+            ), "Outer dimensions of sorted_sequence and values must match for N-D searchsorted"
+
+    def ir(sorted_sequence_buf, values_buf, indices_buf):
+        ib = ir_builder.create()
+        sorted_sequence_shape = sorted_sequence_buf.shape
+        values_shape = values_buf.shape
+        # Total number of search operations to perform.
+        num_search = utils.prod(values_shape)
+        # The length of the innermost dimension where the search happens.
+        search_range = sorted_sequence_shape[-1]
+
+        sorted_sequence_ptr = ib.buffer_ptr(sorted_sequence_buf)
+        values_ptr = ib.buffer_ptr(values_buf)
+        indices_ptr = ib.buffer_ptr(indices_buf)
+
+        # --- GPU THREADING SETUP ---
+        # Get the maximum number of threads per block for the current target.
+        max_threads = int(tvm.target.Target.current(allow_none=False).max_num_threads)
+        # Define thread and block axes.
+        nthread_tx = max_threads
+        nthread_bx = utils.ceil_div(num_search, nthread_tx)
+        tx = te.thread_axis("threadIdx.x")
+        bx = te.thread_axis("blockIdx.x")
+        # Bind the threads and blocks to the execution scope.
+        ib.scope_attr(tx, "thread_extent", nthread_tx)
+        ib.scope_attr(bx, "thread_extent", nthread_bx)
+        # Calculate a unique global thread ID for each thread.
+        tid = bx * nthread_tx + tx
+
+        # Each thread works on one value, guarded to prevent out-of-bounds access.
+        with ib.if_scope(tid < num_search):
+            # Determine the correct 1D slice of `sorted_sequence` to search in.
+            if len(sorted_sequence_shape) == 1:
+                # If the sequence is 1D, all threads search the same sequence.
+                sequence_offset = 0
+            else:
+                # If N-D, find which "row" this thread's value belongs to.
+                # `tid // values_shape[-1]` gives the index of the outer dimension.
+                sequence_id = tid // values_shape[-1]
+                # The offset is the start of that row in the flattened buffer.
+                sequence_offset = sequence_id * search_range
+
+            # Each thread performs a binary search for its assigned value.
+            indices_ptr[tid] = binary_search_gpu(
+                ib,
+                sequence_offset,
+                search_range,
+                sorted_sequence_ptr,
+                values_ptr[tid],
+                right,
+                out_dtype,
+            )
+
+        return ib.get()
+
+    # Use te.extern to define the operation with our custom IR.
+    return te.extern(
+        values.shape,
+        [sorted_sequence, values],
+        lambda ins, outs: ir(ins[0], ins[1], outs[0]),
+        name="searchsorted_gpu",
+        dtype=out_dtype,
+    )
